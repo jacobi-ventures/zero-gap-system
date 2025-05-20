@@ -1,158 +1,104 @@
 
 import streamlit as st
 import pandas as pd
-import numpy as np
 import requests
 import os
 from dotenv import load_dotenv
 from datetime import datetime
-from filters import get_default_filters, get_recommended_filters
-from strategy import run_strategy_scan
-from ui import render_strategy_results
+from strategy import run_strategy
+from filters import get_filters, reset_filters, recommend_filters
+from ui import render_strategy_box
+from ibkr import create_combo_contract, send_combo_order
 
-st.set_page_config(page_title="Zero Gap Tool 1.6.3", layout="centered")
-
-# === VERSION LOG ===
-st.sidebar.title("Zero Gap System Tool — Version 1.6.3")
-st.sidebar.markdown(
-    """**Version History**
-
-**1.6.3 (Current)**
-- Added helper text next to each filter to explain its purpose
-
-**1.6.2**
-- Replaced deprecated rerun method
-- Explained and logged recommended filter logic
-
-**1.6.1**
-- Styled strategy display boxes restored
-- Added Reset Filters and Recommend Filters buttons
-- IBKR Simulation button added
-- Version history restored
-
-**1.5**
-- Simultaneous Spread + Strangle strategy logic
-- Independent filters per strategy
-- API Status indicator
-
-**1.4**
-- Added filter diagnostics when no trades are shown
-- Toggle to disable slippage + fill filters
-- Display count of total vs. filtered trades
-
-**1.3**
-- Added trade/export logging
-- Version history sidebar
-
-**1.2**
-- Added slippage tolerance enforcement
-- Added fill probability scoring
-
-**1.1**
-- IBKR paper trade simulation module
-- Dark mode, clean option formatting
-""",
-    unsafe_allow_html=True
-)
-
-# === API SETUP ===
+st.set_page_config(page_title="Zero Gap Tool (v1.7.5)", layout="centered")
 load_dotenv()
-API_KEY = os.getenv("TRADIER_API_KEY", "s79AiKlnnbAjnSgYkkWuAwC9DnLV")
-HEADERS = {
-    "Authorization": f"Bearer {API_KEY}",
-    "Accept": "application/json"
-}
-BASE_URL = "https://api.tradier.com/v1"
 
-@st.cache_data(ttl=60)
-def check_api_status():
-    try:
-        r = requests.get(f"{BASE_URL}/markets/quotes", headers=HEADERS, params={"symbols": "SPY"})
-        if r.status_code == 200:
-            return "Live" if "quotes" in r.json() else "Delayed"
-        return "Disconnected"
-    except:
-        return "Disconnected"
+st.title("Zero Gap System Tool (v1.7.5)")
 
-status = check_api_status()
-status_color = {"Live": "green", "Delayed": "orange", "Disconnected": "red"}[status]
-st.sidebar.markdown(f"**API Status:** <span style='color:{status_color}'>{status}</span>", unsafe_allow_html=True)
+# UI for symbol and expiration (default expiration today)
+symbol = st.selectbox("Select Ticker", ["XSP","SPX","QQQ","IWM","TSLA"], key="order_symbol")
+expiration = datetime.now().strftime("%Y%m%d")
 
-st.title("Zero Gap Strategy Tool (1.6.3)")
+# Initialize session state
+if "filters" not in st.session_state:
+    st.session_state.filters = get_filters()
+if "last_combo" not in st.session_state:
+    st.session_state.last_combo = None
+if "last_price" not in st.session_state:
+    st.session_state.last_price = None
 
-symbol = st.selectbox("Select Ticker", ["XSP", "SPX", "QQQ", "IWM", "TSLA"])
-
-def get_expirations(sym):
-    url = f"{BASE_URL}/markets/options/expirations"
-    params = {"symbol": sym, "includeAllRoots": "true", "strikes": "false"}
-    r = requests.get(url, headers=HEADERS, params=params)
-
-    if r.status_code != 200:
-        st.error(f"Failed to get expirations for {sym}. Status code: {r.status_code}")
-        return []
-
-    try:
-        return r.json().get("expirations", {}).get("date", [])
-    except requests.exceptions.JSONDecodeError:
-        st.error(f"API returned no data or invalid response for {sym}.")
-        return []
-
-expirations = get_expirations(symbol)
-chosen_exp = st.selectbox("Choose Expiration Date", expirations)
-
-filters = st.session_state.get("filters", get_default_filters())
-
-def reset_filters():
-    st.session_state.filters = get_default_filters()
-
-def recommend_filters():
-    st.session_state.filters = get_recommended_filters()
-
-# === FILTER SLIDERS ===
-st.subheader("Credit Spread Filters")
-
-st.slider("Min Credit", 0.1, 2.0, filters["cs_min_credit"], key="cs_min_credit",
-          help="Minimum credit received when selling a credit spread.")
-st.slider("Max Credit", 0.3, 2.5, filters["cs_max_credit"], key="cs_max_credit",
-          help="Maximum acceptable credit to avoid high risk or illiquidity.")
-st.slider("Strike Gap", 1, 5, filters["cs_strike_gap"], key="cs_strike_gap",
-          help="The gap between sold and bought strike prices in the spread.")
-
-st.subheader("Strangle Filters")
-
-st.slider("Min Distance from Price", 1, 20, filters["str_min_dist"], key="str_min_dist",
-          help="Minimum number of points OTM for both strangle legs.")
-st.slider("Max Total Cost", 0.2, 4.0, filters["str_max_cost"], key="str_max_cost",
-          help="Maximum amount you're willing to pay for the strangle.")
-
+# Filter controls
 col1, col2 = st.columns(2)
 with col1:
-    if st.button("🔄 Reset Filters"):
+    if st.button("Reset Filters"):
         reset_filters()
         st.rerun()
 with col2:
-    if st.button("🎯 Recommend Filters"):
+    if st.button("Recommend Filters"):
         recommend_filters()
         st.rerun()
 
-run_scan = st.button("Run Strategy Scan")
-
-if run_scan:
-    updated_filters = {
-        "cs_min_credit": st.session_state.cs_min_credit,
-        "cs_max_credit": st.session_state.cs_max_credit,
-        "cs_strike_gap": st.session_state.cs_strike_gap,
-        "str_min_dist": st.session_state.str_min_dist,
-        "str_max_cost": st.session_state.str_max_cost
-    }
-
-    top_spread, top_strangle = run_strategy_scan(
-        symbol,
-        chosen_exp,
-        updated_filters,
-        HEADERS,
-        BASE_URL
+# Render sliders
+for key, val in st.session_state.filters.items():
+    minv, maxv, default = val["min"], val["max"], val["value"]
+    step = val.get("step", 1 if isinstance(minv, int) and isinstance(maxv, int) else 0.1)
+    st.slider(
+        label=key.replace("_", " ").title(),
+        min_value=minv,
+        max_value=maxv,
+        value=default,
+        step=step,
+        key=key,
+        help=val.get("help", "")
     )
 
-    st.subheader("Recommended Strategy (Combined)")
-    render_strategy_results(top_spread, top_strangle)
+# Run strategy scan
+if st.button("Run Strategy Scan"):
+    spread, strangle = run_strategy(st.session_state.filters)
+    render_strategy_box(spread, strangle)
+
+    # Prepare combo if valid
+    if spread and strangle:
+        # parse legs
+        def parse_leg(leg_str):
+            parts = leg_str.split()
+            s_cp = parts[-1]
+            return float(s_cp[:-1]), s_cp[-1]
+
+        sell_strike, sell_right = parse_leg(spread["sell_leg"])
+        buy_strike, buy_right   = parse_leg(spread["buy_leg"])
+        put_strike, put_right   = parse_leg(strangle["put_leg"])
+        call_strike, call_right = parse_leg(strangle["call_leg"])
+
+        spreads = [
+            {"strike": sell_strike, "right": sell_right, "action": "SELL"},
+            {"strike": buy_strike,  "right": buy_right,  "action": "BUY"}
+        ]
+        strangles = [
+            {"strike": put_strike,  "right": put_right,  "action": "BUY"},
+            {"strike": call_strike, "right": call_right, "action": "BUY"}
+        ]
+        legs = spreads + strangles
+
+        # Create combo and store
+        try:
+            combo = create_combo_contract(symbol, expiration, legs)
+            st.session_state.last_combo = combo
+            st.session_state.last_price = spread["credit"]
+            st.success("Combo prepared and ready to send.")
+        except Exception as e:
+            st.error(f"Error preparing combo: {e}")
+
+# Persistent send to IBKR button
+if st.session_state.last_combo:
+    st.markdown("### Ready to Send to IBKR")
+    if st.button("Send to IBKR (Paper Test)", key="send_ibkr"):
+        try:
+            status = send_combo_order(
+                st.session_state.last_combo,
+                price=st.session_state.last_price,
+                dry_run=True
+            )
+            st.success(f"IBKR Order Status: {status}")
+        except Exception as e:
+            st.error(f"IBKR Error: {e}")
